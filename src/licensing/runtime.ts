@@ -12,6 +12,7 @@ import { Logger } from '@config/logger.config';
 import { createHash } from 'crypto';
 import { NextFunction, Request, Response } from 'express';
 
+import { LICENSING_ENABLED } from './config';
 import { activateIntegrity } from './integrity';
 import { RegisterExchangeResponse, RuntimeContextSnapshot } from './model';
 import { loadOrCreateInstanceID, loadRuntimeData, saveRuntimeData } from './store';
@@ -127,6 +128,25 @@ export async function initializeRuntime(opts: InitializeOptions = {}): Promise<R
   const globalApiKey = opts.globalApiKey ?? '';
 
   const rc = new RuntimeContext(globalApiKey, tier, version);
+
+  // Offline mode (default in this fork — see ./config.ts). Activate locally and
+  // return before any licensing-server round-trip: no /v1/activate, no
+  // /v1/register/auto, no heartbeat.
+  if (!LICENSING_ENABLED) {
+    try {
+      rc.instanceId = await loadOrCreateInstanceID();
+    } catch {
+      // RuntimeConfig table may not exist yet; the ID is cosmetic in offline mode.
+      rc.instanceId = 'offline';
+    }
+    rc.apiKey = globalApiKey || 'offline';
+    rc.recomputeContextHash();
+    rc.setActive(true);
+    activateIntegrity(rc);
+    globalRC = rc;
+    logger.info('Licensing disabled (LICENSING_ENABLED != true) — offline mode, no outbound calls');
+    return rc;
+  }
 
   // Step 1: Instance ID (hardware-based, persistent across restarts).
   try {
@@ -293,6 +313,7 @@ function maskKey(key: string): string {
 
 /** Validates context. Returns [active, registerUrl]. */
 export function validateContext(rc: RuntimeContext | null): [boolean, string] {
+  if (!LICENSING_ENABLED) return [true, ''];
   if (!rc) return [false, ''];
   if (!rc.isActive()) return [false, rc.registerUrl];
   // Verify hash integrity.
@@ -309,6 +330,11 @@ export function validateContext(rc: RuntimeContext | null): [boolean, string] {
  * License routes (/license/*), assets, manager UI, health and websocket always pass.
  */
 export function gateMiddleware(rc: RuntimeContext) {
+  // Offline mode: no gate at all — every route passes straight through.
+  if (!LICENSING_ENABLED) {
+    return (_req: Request, _res: Response, next: NextFunction) => next();
+  }
+
   return (req: Request, res: Response, next: NextFunction) => {
     const path = req.path;
 
@@ -442,6 +468,12 @@ async function sendHeartbeat(rc: RuntimeContext, uptimeSeconds: number): Promise
 
 /** Starts the periodic heartbeat. Fire-and-forget — failures never block the service. */
 export function startHeartbeat(rc: RuntimeContext, startTime: Date): NodeJS.Timeout {
+  // Offline mode: no telemetry. Return an inert timer so callers can still
+  // clearInterval() it without a null check.
+  if (!LICENSING_ENABLED) {
+    return setInterval(() => undefined, 2_147_483_647).unref();
+  }
+
   return setInterval(async () => {
     if (!rc.isActive()) return;
     const uptime = Math.floor((Date.now() - startTime.getTime()) / 1000);
@@ -455,6 +487,7 @@ export function startHeartbeat(rc: RuntimeContext, startTime: Date): NodeJS.Time
 
 /** Notifies the licensing server about shutdown. Best-effort. */
 export async function shutdown(rc: RuntimeContext | null): Promise<void> {
+  if (!LICENSING_ENABLED) return;
   if (!rc || !rc.apiKey) return;
   try {
     await postSigned('/v1/deactivate', { instance_id: rc.instanceId }, rc.apiKey);
